@@ -25,6 +25,7 @@ fi
 echo "============================================="
 echo "        自动关机系统 一键完整安装            "
 echo "  架构：API优先 + 本地库降级 + 年度自动升级  "
+echo "  版本：v2.0 (修复缓存解析Bug)              "
 echo "============================================="
 
 # 交互配置端口、密码
@@ -58,8 +59,8 @@ echo "" >> ${LOG_FILE}
 EOF
 chmod +x "${UPD_SCRIPT}"
 
-# 4. 编写核心定时关机脚本（API优先 + 本地库降级 + 年份兜底）
-echo "[4/9] 部署定时关机核心脚本"
+# 4. 编写核心定时关机脚本（修复版 - API解析使用jq直接生成JSON）
+echo "[4/9] 部署定时关机核心脚本（修复版）"
 cat > "${SHUTDOWN_BIN}" <<'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -80,6 +81,11 @@ CUR_YEAR=$(date +%Y)
 CC_START_YEAR=2004
 CC_END_YEAR=2026
 
+# 日志函数
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
 init_empty_cache() {
     echo "{}" > "${CACHE_FILE}"
     chmod 644 "${CACHE_FILE}"
@@ -95,32 +101,57 @@ http_get() {
             echo "${res}"
             return 0
         fi
+        log_info "API请求失败，重试 ${retry}/${MAX_RETRY}"
         ((retry++))
         sleep 1
     done
     return 1
 }
 
-# 方案1：优先在线API bitefu
+# 方案1：优先在线API bitefu（修复版 - 使用jq直接生成完整JSON）
 refresh_by_api() {
+    log_info "尝试从在线API获取节假日数据..."
     local url="https://tool.bitefu.net/jiari/?d=${CUR_YEAR}&json=1"
     local raw
     raw=$(http_get "${url}") || return 1
 
-    init_empty_cache
-    echo "${raw}" | jq -r --arg y "${CUR_YEAR}" '.[$y] | to_entries[] | .key + " " + (.value|tostring)' | while read -r date_str type; do
-        full_date="${CUR_YEAR}-${date_str:0:2}-${date_str:2:2}"
-        work_flag=$([ "${type}" = "2" ] && echo "false" || echo "true")
-        jq --arg d "${full_date}" --argjson v "${work_flag}" '.[$d] = $v' "${CACHE_FILE}" > /tmp/_tmp_cache.tmp
-        mv /tmp/_tmp_cache.tmp "${CACHE_FILE}"
-    done
-    return 0
+    log_info "API请求成功，开始解析数据..."
+    
+    # 使用jq直接生成完整的JSON缓存，避免子shell变量作用域问题
+    # API返回格式：{"2026": {"0101": 1, "0102": 2, ...}} 
+    # 1=节假日, 2=工作日调休(当作工作日), 其他=节假日
+    if echo "${raw}" | jq -e --arg y "${CUR_YEAR}" '.[$y]' > /dev/null 2>&1; then
+        echo "${raw}" | jq --arg y "${CUR_YEAR}" '
+            .[$y] // {} 
+            | to_entries 
+            | map({
+                key: ($y + "-" + (.key[0:2] + "-" + .key[2:4])),
+                value: (.value == "1" or .value == "3" or .value == "4")
+            })
+            | from_entries
+        ' > "${CACHE_FILE}"
+        
+        chmod 644 "${CACHE_FILE}"
+        
+        # 验证缓存是否生成成功
+        local count=$(jq '. | length' "${CACHE_FILE}" 2>/dev/null || echo "0")
+        if [[ "${count}" -gt 0 ]]; then
+            log_info "✅ API解析成功，缓存了 ${count} 天的数据"
+            return 0
+        else
+            log_info "⚠️  API解析结果为空，尝试降级"
+            return 1
+        fi
+    else
+        log_info "⚠️  API返回数据格式异常"
+        return 1
+    fi
 }
 
 # 方案2：降级到本地 chinesecalendar 库
 refresh_by_local_lib() {
+    log_info "切换至本地 chinesecalendar 节假日库..."
     init_empty_cache
-    echo "切换至本地 chinesecalendar 节假日库"
     python3 - <<PYEOF
 import datetime
 from chinese_calendar import is_workday
@@ -138,13 +169,14 @@ while current <= end:
 with open("${CACHE_FILE}", "w", encoding="utf-8") as f:
     json.dump(cache, f)
 PYEOF
+    log_info "✅ 本地库生成缓存完成"
     return 0
 }
 
 # 方案3：年份超限兜底：周一至周五为工作日
 refresh_by_week() {
+    log_info "年份超出本地库支持范围，启用周规则兜底(周一~周五=工作日)..."
     init_empty_cache
-    echo "年份超出本地库支持范围，启用周规则兜底(周一~周五=工作日)"
     python3 - <<PYEOF
 import datetime
 import json
@@ -162,59 +194,79 @@ while current <= end:
 with open("${CACHE_FILE}", "w", encoding="utf-8") as f:
     json.dump(cache, f)
 PYEOF
+    log_info "✅ 周规则兜底缓存完成"
     return 0
 }
 
 # ==================== 执行刷新逻辑 ====================
-echo "==================== 刷新节假日缓存 ===================="
-echo "当前年份：${CUR_YEAR}"
+log_info "==================== 刷新节假日缓存 ===================="
+log_info "当前年份：${CUR_YEAR}"
+
+REFRESH_SUCCESS=false
 
 if refresh_by_api; then
-    echo "✅ 在线API 请求成功"
+    REFRESH_SUCCESS=true
+    log_info "✅ 在线API 请求成功"
 elif [[ ${CUR_YEAR} -ge ${CC_START_YEAR} && ${CUR_YEAR} -le ${CC_END_YEAR} ]]; then
-    echo "❌ API失败，使用本地节假日库"
-    refresh_by_local_lib
+    log_info "❌ API失败，使用本地节假日库"
+    if refresh_by_local_lib; then
+        REFRESH_SUCCESS=true
+    fi
 else
-    echo "⚠️  年份超出本地库范围，启用周规则兜底"
-    refresh_by_week
+    log_info "⚠️  年份超出本地库范围，启用周规则兜底"
+    if refresh_by_week; then
+        REFRESH_SUCCESS=true
+    fi
 fi
 
-echo -e "\n==== 缓存内容 ===="
-cat "${CACHE_FILE}"
+# 验证缓存有效性
+if [[ "${REFRESH_SUCCESS}" == "true" ]]; then
+    CACHE_COUNT=$(jq '. | length' "${CACHE_FILE}" 2>/dev/null || echo "0")
+    if [[ "${CACHE_COUNT}" -eq 0 ]]; then
+        log_info "⚠️  缓存生成失败（空文件），使用紧急兜底"
+        refresh_by_week
+        REFRESH_SUCCESS=true
+    fi
+fi
+
+log_info "==== 缓存内容预览（前10条） ===="
+jq 'to_entries | .[:10] | from_entries' "${CACHE_FILE}" 2>/dev/null || echo "缓存读取失败"
 
 if [[ "${ONLY_REFRESH}" == "true" ]]; then
-    echo -e "\n缓存刷新完成，不执行关机"
+    log_info "缓存刷新完成，不执行关机（--refresh模式）"
     exit 0
 fi
 
 # ==================== 关机判定逻辑 ====================
-echo -e "\n==================== 关机判定 ===================="
+log_info "==================== 关机判定 ===================="
 if [ -f "${GLOBAL_LOCK}" ]; then
-    echo "🔒 全局禁用锁存在，不执行关机"
+    log_info "🔒 全局禁用锁存在，不执行关机"
     exit 0
 fi
 if [ -f "${TEMP_LOCK}" ]; then
-    echo "🔒 临时禁用锁存在，清理临时锁，本次不关机"
+    log_info "🔒 临时禁用锁存在，清理临时锁，本次不关机"
     rm -f "${TEMP_LOCK}"
     exit 0
 fi
 
 TODAY=$(date +%Y-%m-%d)
-echo "当前日期：${TODAY}"
-IS_WORK=$(jq -r --arg t "${TODAY}" '.[$t] // true' "${CACHE_FILE}" 2>/dev/null || true)
-echo "当日是否工作日：${IS_WORK}"
+log_info "当前日期：${TODAY}"
+
+# 从缓存获取今日是否工作日，若缓存不存在或读取失败则默认为true
+IS_WORK=$(jq -r --arg t "${TODAY}" '.[$t] // true' "${CACHE_FILE}" 2>/dev/null || echo "true")
+log_info "当日是否工作日：${IS_WORK}"
 
 if [[ "${IS_WORK}" == "true" ]]; then
-    echo "✅ 执行自动关机"
+    log_info "✅ 执行自动关机"
     /sbin/shutdown -h now
 else
-    echo "⏸️  节假日，跳过关机"
+    log_info "⏸️  节假日/周末，跳过关机"
     exit 0
 fi
 EOF
 chmod +x "${SHUTDOWN_BIN}"
 
-# 5. 部署Python Web控制面板（精简无歧义版）
+# 5. 部署Python Web控制面板（精简无歧义版 + 缓存状态显示）
 echo "[5/9] 部署Web控制面板（精简无歧义版）"
 cat > "${WEB_SCRIPT}" <<EOF
 #!/usr/bin/env python3
@@ -284,14 +336,22 @@ class Handler(BaseHTTPRequestHandler):
             has_tmp_lock = os.path.exists(LOCK_TMP)
             has_glb_lock = os.path.exists(LOCK_GLB)
 
-            # 读取缓存里今天的工作日状态（如果缓存不存在，默认True）
+            # 读取缓存信息
             today = datetime.date.today()
             today_str = today.strftime("%Y-%m-%d")
             is_workday = True
+            cache_days = 0
+            cache_year = "未知"
             try:
                 with open(CACHE_FILE, "r", encoding="utf-8") as f:
                     cache = json.load(f)
+                cache_days = len(cache)
                 is_workday = cache.get(today_str, True)
+                if cache_days > 0:
+                    # 尝试提取年份
+                    first_key = next(iter(cache.keys()))
+                    if len(first_key) >= 4:
+                        cache_year = first_key[:4]
             except Exception:
                 pass
 
@@ -323,7 +383,6 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 status_text = "✅ 自动关机已正常开启"
 
-            # 精简HTML模板（去掉“今晚是否关机”）
             html = f"""
 <html>
 <head>
@@ -336,7 +395,9 @@ class Handler(BaseHTTPRequestHandler):
     button {{ padding: 10px 20px; margin: 10px; font-size: 16px; cursor: pointer; border: none; border-radius: 4px; }}
     .btn-red {{ background: #ff4d4f; color: white; }}
     .btn-green {{ background: #52c41a; color: white; }}
+    .btn-blue {{ background: #1890ff; color: white; }}
     .note {{ font-size: 14px; color: #666; margin-top: 20px; text-align: left; width: 60%; margin-left: auto; margin-right: auto; }}
+    .cache-info {{ background: #e6f7ff; padding: 10px; margin: 10px auto; width: 60%; border-radius: 4px; border: 1px solid #91d5ff; }}
 </style>
 </head>
 <body>
@@ -346,6 +407,12 @@ class Handler(BaseHTTPRequestHandler):
         <h3>当前系统状态</h3>
         <p>{status_text}</p>
         <p>⏰ 下次关机时间：{next_shutdown_text}</p>
+    </div>
+
+    <div class="cache-info">
+        <p>📅 缓存状态：{cache_days} 天数据（{cache_year}年）</p>
+        <p>📌 今天({today_str})：{"工作日" if is_workday else "节假日/周末"}</p>
+        <p><a href="/refresh_cache?p={pwd}" style="color: #1890ff;">点击手动刷新缓存</a></p>
     </div>
 
     <div class="btn-group">
@@ -365,11 +432,30 @@ class Handler(BaseHTTPRequestHandler):
         <p>2. 「今晚不关机」只影响当天，第二天会自动恢复正常规则，无需手动恢复。</p>
         <p>3. 「永久关闭自动关机」会一直不关机，需要点击「恢复自动关机」才能重新启用。</p>
         <p>4. 节假日数据优先从网络接口获取，网络异常时会自动使用本地库兜底。</p>
+        <p>5. 缓存数据包含全年日期，如果发现日期判断错误，可点击「手动刷新缓存」。</p>
     </div>
 </body>
 </html>
             """
             self._html(html)
+            return
+
+        if path == "/refresh_cache":
+            if pwd != PWD_KEY:
+                self._403()
+                return
+            # 调用刷新脚本
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ["/usr/local/bin/auto_shutdown_full.sh", "--refresh"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                self._text(f"缓存刷新完成\n\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}")
+            except Exception as e:
+                self._text(f"缓存刷新失败: {str(e)}")
             return
 
         if path == "/tmp_off":
@@ -402,6 +488,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/glb_on":
             if pwd != PWD_KEY:
                 self._403()
+                return
             try:
                 os.unlink(LOCK_GLB)
             except OSError:
@@ -437,36 +524,77 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-# 7. 配置全部定时任务
+# 7. 配置全部定时任务（修复版 - 先清理再添加）
 echo "[7/9] 配置定时任务（关机+缓存刷新+年度自动升级）"
 CRON_DAILY="01 00 * * * ${SHUTDOWN_BIN} >> ${LOG_DAILY} 2>&1"
 CRON_WEEKLY="00 12 * * 1 ${SHUTDOWN_BIN} --refresh >> ${LOG_WEEKLY} 2>&1"
 CRON_UPD1="00 03 1 12 * ${UPD_SCRIPT}"
 CRON_UPD2="00 03 15 12 * ${UPD_SCRIPT}"
 
+# 先清理所有相关任务
 (crontab -l 2>/dev/null || true) \
 | grep -v "auto_shutdown_full.sh" \
 | grep -v "update_cc.sh" \
-| cat <(echo "${CRON_DAILY}") <(echo "${CRON_WEEKLY}") <(echo "${CRON_UPD1}") <(echo "${CRON_UPD2}") - \
-| crontab -
+| crontab - 2>/dev/null || true
+
+# 再添加新任务（使用追加方式避免覆盖）
+(crontab -l 2>/dev/null || true; echo "${CRON_DAILY}") | crontab -
+(crontab -l 2>/dev/null || true; echo "${CRON_WEEKLY}") | crontab -
+(crontab -l 2>/dev/null || true; echo "${CRON_UPD1}") | crontab -
+(crontab -l 2>/dev/null || true; echo "${CRON_UPD2}") | crontab -
+
+echo "定时任务配置完成"
+crontab -l | grep -E "auto_shutdown|update_cc" || echo "⚠️ 未找到定时任务"
 
 # 8. 初始化缓存 & 放行防火墙
 echo "[8/9] 初始化节假日缓存 & 放行端口"
-init_empty_cache() {
-    echo "{}" > "${CACHE_FILE}"
-    chmod 644 "${CACHE_FILE}"
-}
-init_empty_cache
-"${SHUTDOWN_BIN}" --refresh || true
 
-ufw allow ${LISTEN_PORT}/tcp || true
-ufw reload || true
+# 初始化空缓存
+echo "{}" > "${CACHE_FILE}"
+chmod 644 "${CACHE_FILE}"
+
+# 执行首次缓存刷新
+echo "执行首次缓存刷新..."
+if "${SHUTDOWN_BIN}" --refresh; then
+    echo "✅ 缓存初始化成功"
+else
+    echo "⚠️ 缓存初始化失败（API和本地库都不可用），使用周规则兜底"
+    # 手动执行周规则兜底
+    python3 - <<PYEOF
+import datetime
+import json
+cache = {}
+year = datetime.date.today().year
+start = datetime.date(year, 1, 1)
+end = datetime.date(year, 12, 31)
+delta = datetime.timedelta(days=1)
+current = start
+while current <= end:
+    d_str = current.strftime("%Y-%m-%d")
+    cache[d_str] = current.weekday() < 5
+    current += delta
+with open("${CACHE_FILE}", "w", encoding="utf-8") as f:
+    json.dump(cache, f)
+PYEOF
+    echo "✅ 周规则兜底缓存生成完成"
+fi
+
+# 放行防火墙
+ufw allow ${LISTEN_PORT}/tcp 2>/dev/null || true
+ufw reload 2>/dev/null || true
 
 # 9. 启动Web服务
 echo "[9/9] 启动Web控制面板"
 systemctl daemon-reload
 systemctl start shutdown-web
 systemctl enable shutdown-web
+
+# 验证服务状态
+if systemctl is-active --quiet shutdown-web; then
+    echo "✅ Web服务运行正常"
+else
+    echo "⚠️ Web服务启动失败，请检查日志：journalctl -u shutdown-web -n 50"
+fi
 
 # 完成提示
 LOCAL_IP=$(hostname -I | awk '{print $1}')
@@ -482,4 +610,12 @@ echo "   3. 每年12月1日、15日 03:00 自动升级节假日库（双次防�
 echo ""
 echo "🔧 优先级架构："
 echo "   在线API(bitefu) → 本地chinesecalendar库 → 周规则兜底"
+echo ""
+echo "📊 验证缓存："
+echo "   cat ${CACHE_FILE} | jq '. | length'  # 查看缓存天数"
+echo "   cat ${CACHE_FILE} | jq '.\"$(date +%Y-%m-%d)\"'  # 查看今天是否工作日"
+echo ""
+echo "🐛 如果遇到问题，查看日志："
+echo "   tail -f ${LOG_DAILY}"
+echo "   tail -f ${LOG_WEEKLY}"
 echo "============================================="
