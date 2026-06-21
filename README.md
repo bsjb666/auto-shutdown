@@ -1,6 +1,4 @@
-好的，我已将完整的 `README.md` 翻译为英文。以下是英文版本，您可以直接替换原文件。
 
----
 
 ```markdown
 # Auto-Shutdown System
