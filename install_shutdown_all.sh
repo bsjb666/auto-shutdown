@@ -108,7 +108,7 @@ http_get() {
     return 1
 }
 
-# 方案1：优先在线API bitefu（修复版 - 使用jq直接生成完整JSON）
+# 方案1：优先在线API bitefu（生成完整年度缓存，包含周末和调休）
 refresh_by_api() {
     log_info "尝试从在线API获取节假日数据..."
     local url="https://tool.bitefu.net/jiari/?d=${CUR_YEAR}&json=1"
@@ -116,34 +116,55 @@ refresh_by_api() {
     raw=$(http_get "${url}") || return 1
 
     log_info "API请求成功，开始解析数据..."
-    
-    # 使用jq直接生成完整的JSON缓存，避免子shell变量作用域问题
-    # API返回格式：{"2026": {"0101": 1, "0102": 2, ...}} 
-    # 1=节假日, 2=工作日调休(当作工作日), 其他=节假日
+
+    # 使用 Python 生成全年基准缓存：周末 false，工作日 true
+    python3 - <<PYEOF > /tmp/base_cache_$$.json
+import datetime, json
+year = ${CUR_YEAR}
+start = datetime.date(year, 1, 1)
+end = datetime.date(year, 12, 31)
+cache = {}
+cur = start
+while cur <= end:
+    # weekday(): 0-4 工作日，5-6 周末
+    cache[cur.strftime("%Y-%m-%d")] = cur.weekday() < 5
+    cur += datetime.timedelta(days=1)
+with open("/tmp/base_cache_$$.json", "w") as f:
+    json.dump(cache, f)
+PYEOF
+
+    # 检查 API 返回是否包含当年数据
     if echo "${raw}" | jq -e --arg y "${CUR_YEAR}" '.[$y]' > /dev/null 2>&1; then
-        echo "${raw}" | jq --arg y "${CUR_YEAR}" '
-            .[$y] // {} 
-            | to_entries 
-            | map({
-                key: ($y + "-" + (.key[0:2] + "-" + .key[2:4])),
-                value: (.value == "1" or .value == "3" or .value == "4")
-            })
-            | from_entries
-        ' > "${CACHE_FILE}"
-        
+        # 合并：先用基准（周末false，工作日true），再用API覆盖
+        jq --argjson base "$(cat /tmp/base_cache_$$.json)" --arg y "${CUR_YEAR}" '
+            $base + (
+                .[$y] // {} 
+                | to_entries 
+                | map({
+                    key: ($y + "-" + (.key[0:2] + "-" + .key[2:4])),
+                    value: if .value == "1" or .value == "3" or .value == "4" then false
+                           elif .value == "2" then true
+                           else null end
+                })
+                | map(select(.value != null))
+                | from_entries
+            )
+        ' <<< "${raw}" > "${CACHE_FILE}"
+
+        rm -f /tmp/base_cache_$$.json
         chmod 644 "${CACHE_FILE}"
-        
-        # 验证缓存是否生成成功
+
         local count=$(jq '. | length' "${CACHE_FILE}" 2>/dev/null || echo "0")
-        if [[ "${count}" -gt 0 ]]; then
-            log_info "✅ API解析成功，缓存了 ${count} 天的数据"
+        if [[ "${count}" -eq 365 || "${count}" -eq 366 ]]; then
+            log_info "✅ API解析成功，缓存了 ${count} 天的数据（包含周末和调休）"
             return 0
         else
-            log_info "⚠️  API解析结果为空，尝试降级"
+            log_info "⚠️  API解析结果天数异常（${count}），降级处理"
             return 1
         fi
     else
         log_info "⚠️  API返回数据格式异常"
+        rm -f /tmp/base_cache_$$.json
         return 1
     fi
 }
