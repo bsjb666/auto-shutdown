@@ -1,8 +1,7 @@
-是的，README 需要更新！原 README 缺少新功能说明、修复记录和更详细的使用指南。我为你提供完整更新版。
 
 ---
 
-## 📚 完整更新版 README
+## 📚 完整版 README
 
 ```markdown
 # auto-shutdown 自动关机系统
