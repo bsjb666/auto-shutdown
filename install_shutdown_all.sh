@@ -25,7 +25,7 @@ fi
 echo "============================================="
 echo "        自动关机系统 一键完整安装            "
 echo "  架构：API优先 + 本地库降级 + 年度自动升级  "
-echo "  版本：v2.0 (修复缓存解析Bug)              "
+echo "  版本：v2.1 (彻底修复缓存与jq语法)         "
 echo "============================================="
 
 # 交互配置端口、密码
@@ -59,11 +59,17 @@ echo "" >> ${LOG_FILE}
 EOF
 chmod +x "${UPD_SCRIPT}"
 
-# 4. 编写核心定时关机脚本（修复版 - API解析使用jq直接生成JSON）
-echo "[4/9] 部署定时关机核心脚本（修复版）"
+# 4. 编写核心定时关机脚本（修复版 - 包含完整缓存、jq语法修正、强制验证）
+echo "[4/9] 部署定时关机核心脚本（修复版 v2.1）"
 cat > "${SHUTDOWN_BIN}" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+
+# ========== 强制设置 PATH（解决 cron 环境找不到 jq/curl） ==========
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ========== 定义自身路径（解决自我调用时 unbound variable） ==========
+SHUTDOWN_BIN="/usr/local/bin/auto_shutdown_full.sh"
 
 ONLY_REFRESH="false"
 if [[ $# -ge 1 && "$1" == "--refresh" ]]; then
@@ -108,7 +114,9 @@ http_get() {
     return 1
 }
 
-# 方案1：优先在线API bitefu（生成完整年度缓存，包含周末和调休）
+# ======================================================================
+# 方案1：优先在线API bitefu（修复 jq 语法，确保生成全年完整缓存）
+# ======================================================================
 refresh_by_api() {
     log_info "尝试从在线API获取节假日数据..."
     local url="https://tool.bitefu.net/jiari/?d=${CUR_YEAR}&json=1"
@@ -117,8 +125,9 @@ refresh_by_api() {
 
     log_info "API请求成功，开始解析数据..."
 
-    # 使用 Python 生成全年基准缓存：周末 false，工作日 true
-    python3 - <<PYEOF > /tmp/base_cache_$$.json
+    # 1) 用 Python 生成全年基准缓存（周末 false，工作日 true）
+    local base_file="/tmp/base_cache_$$.json"
+    python3 - <<PYEOF > "${base_file}"
 import datetime, json
 year = ${CUR_YEAR}
 start = datetime.date(year, 1, 1)
@@ -126,23 +135,21 @@ end = datetime.date(year, 12, 31)
 cache = {}
 cur = start
 while cur <= end:
-    # weekday(): 0-4 工作日，5-6 周末
     cache[cur.strftime("%Y-%m-%d")] = cur.weekday() < 5
     cur += datetime.timedelta(days=1)
-with open("/tmp/base_cache_$$.json", "w") as f:
-    json.dump(cache, f)
+json.dump(cache, open("${base_file}", "w"))
 PYEOF
 
-    # 检查 API 返回是否包含当年数据
+    # 2) 检查 API 是否包含当年数据
     if echo "${raw}" | jq -e --arg y "${CUR_YEAR}" '.[$y]' > /dev/null 2>&1; then
-        # 合并：先用基准（周末false，工作日true），再用API覆盖
-        jq --argjson base "$(cat /tmp/base_cache_$$.json)" --arg y "${CUR_YEAR}" '
+        # 3) 合并：基准 + API覆盖（正确写法，避免 jq 语法错误）
+        jq --argjson base "$(cat "${base_file}")" --arg y "${CUR_YEAR}" '
             $base + (
                 .[$y] // {} 
                 | to_entries 
                 | map({
                     key: ($y + "-" + (.key[0:2] + "-" + .key[2:4])),
-                    value: if .value == "1" or .value == "3" or .value == "4" then false
+                    value: if (.value == "1" or .value == "3" or .value == "4") then false
                            elif .value == "2" then true
                            else null end
                 })
@@ -151,7 +158,7 @@ PYEOF
             )
         ' <<< "${raw}" > "${CACHE_FILE}"
 
-        rm -f /tmp/base_cache_$$.json
+        rm -f "${base_file}"
         chmod 644 "${CACHE_FILE}"
 
         local count=$(jq '. | length' "${CACHE_FILE}" 2>/dev/null || echo "0")
@@ -164,12 +171,14 @@ PYEOF
         fi
     else
         log_info "⚠️  API返回数据格式异常"
-        rm -f /tmp/base_cache_$$.json
+        rm -f "${base_file}"
         return 1
     fi
 }
 
-# 方案2：降级到本地 chinesecalendar 库
+# ======================================================================
+# 方案2：降级到本地 chinesecalendar 库（同样生成全年完整缓存）
+# ======================================================================
 refresh_by_local_lib() {
     log_info "切换至本地 chinesecalendar 节假日库..."
     init_empty_cache
@@ -194,7 +203,9 @@ PYEOF
     return 0
 }
 
+# ======================================================================
 # 方案3：年份超限兜底：周一至周五为工作日
+# ======================================================================
 refresh_by_week() {
     log_info "年份超出本地库支持范围，启用周规则兜底(周一~周五=工作日)..."
     init_empty_cache
@@ -209,7 +220,6 @@ delta = datetime.timedelta(days=1)
 current = start
 while current <= end:
     d_str = current.strftime("%Y-%m-%d")
-    # weekday() 0-4 工作日，5-6 周末
     cache[d_str] = current.weekday() < 5
     current += delta
 with open("${CACHE_FILE}", "w", encoding="utf-8") as f:
@@ -273,7 +283,13 @@ fi
 TODAY=$(date +%Y-%m-%d)
 log_info "当前日期：${TODAY}"
 
-# 从缓存获取今日是否工作日，若缓存不存在或读取失败则默认为true
+# ========== 强制验证缓存中今天日期是否存在，若缺失则立即刷新 ==========
+if ! jq -e --arg t "${TODAY}" '.[$t]' "${CACHE_FILE}" >/dev/null 2>&1; then
+    log_info "⚠️  缓存中今天日期缺失，强制刷新..."
+    "${SHUTDOWN_BIN}" --refresh
+fi
+
+# 重新读取（无论是否刷新过，都重新获取）
 IS_WORK=$(jq -r --arg t "${TODAY}" '.[$t] // true' "${CACHE_FILE}" 2>/dev/null || echo "true")
 log_info "当日是否工作日：${IS_WORK}"
 
