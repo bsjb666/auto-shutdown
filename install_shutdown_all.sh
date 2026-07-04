@@ -1,658 +1,508 @@
 #!/bin/bash
-set -euo pipefail
+set -e
 
-# ==================== 全局配置 ====================
-DEFAULT_PORT="6788"
-DEFAULT_PWD="Admin@123456"
-GLOBAL_LOCK="/etc/no_shutdown_all.lock"
-TEMP_LOCK="/tmp/no_shutdown.lock"
-CACHE_FILE="/var/cache/holiday_flat.json"
-APP_DIR="/opt/shutdown-ctrl"
-WEB_SCRIPT="${APP_DIR}/web.py"
-SHUTDOWN_BIN="/usr/local/bin/auto_shutdown_full.sh"
-UPD_SCRIPT="${APP_DIR}/update_cc.sh"
-UPD_LOG="${APP_DIR}/update_cc.log"
-LOG_DAILY="/var/log/auto_shutdown.log"
-LOG_WEEKLY="/var/log/auto_shutdown_refresh.log"
-SERVICE_FILE="/etc/systemd/system/shutdown-web.service"
+# ======================默认配置(回车直接使用)======================
+DEFAULT_PORT=6788
+DEFAULT_PASSWORD="admin123"
+CRON_TIME="01 00 * * *"
+LOG_FILE="/var/log/auto_shutdown.log"
+CONFIG_FILE="/opt/shutdown-ctrl/config.env"
+LOCK_TMP="/tmp/no_shutdown.lock"
+LOCK_GLB="/etc/no_shutdown_all.lock"
+# =================================================================
 
-# 权限校验
 if [[ $(id -u) -ne 0 ]]; then
-    echo "请使用 root / sudo 执行本脚本"
+    echo -e "\033[31m错误：必须使用root用户执行！\033[0m"
     exit 1
 fi
 
-echo "============================================="
-echo "        自动关机系统 一键完整安装            "
-echo "  架构：API优先 + 本地库降级 + 年度自动升级  "
-echo "  版本：v2.1 (彻底修复缓存与jq语法)         "
-echo "============================================="
+echo -e "\033[34m======================================================\033[0m"
+echo -e "\033[32m  自动关机系统 - 新增下次关机日期显示版  \033[0m"
+echo -e "\033[34m======================================================\033[0m"
+echo -e "\033[36m请设置Web面板端口与管理密码，支持数字/字母/!@#$%^&*等特殊符号，直接回车使用默认值\033[0m"
+echo ""
 
-# 交互配置端口、密码
-read -p "请输入面板监听端口(默认 ${DEFAULT_PORT}): " LISTEN_PORT
-LISTEN_PORT=${LISTEN_PORT:-${DEFAULT_PORT}}
+# 交互式输入端口，合法性校验
+while true; do
+    read -rp "请输入Web端口(默认${DEFAULT_PORT}，范围1-65535)：" INPUT_PORT
+    if [[ -z "${INPUT_PORT}" ]]; then
+        PORT=${DEFAULT_PORT}
+        break
+    fi
+    if [[ "${INPUT_PORT}" =~ ^[0-9]+$ ]] && (( INPUT_PORT >= 1 && INPUT_PORT <= 65535 )); then
+        PORT=${INPUT_PORT}
+        break
+    else
+        echo -e "\033[31m端口非法，请输入1~65535纯数字\033[0m"
+    fi
+done
+echo -e "\033[32m选定端口：${PORT}\033[0m"
+echo ""
 
-read -p "请输入面板访问密码(默认 ${DEFAULT_PWD}): " ACCESS_PWD
-ACCESS_PWD=${ACCESS_PWD:-${DEFAULT_PWD}}
+# 交互式输入密码，隐藏输入+二次确认，完整支持特殊符号
+while true; do
+    read -rsp "请输入管理密码(支持!@#$%^&*等符号，默认${DEFAULT_PASSWORD})：" INPUT_PWD
+    echo ""
+    if [[ -z "${INPUT_PWD}" ]]; then
+        PASSWORD=${DEFAULT_PASSWORD}
+        break
+    fi
+    read -rsp "再次确认密码：" CONFIRM_PWD
+    echo ""
+    if [[ "${INPUT_PWD}" == "${CONFIRM_PWD}" ]]; then
+        PASSWORD=${INPUT_PWD}
+        break
+    else
+        echo -e "\033[31m两次密码不一致，请重新输入\033[0m"
+        echo ""
+    fi
+done
+echo -e "\033[32m密码配置完成\033[0m"
+echo -e "\033[34m======================================================\033[0m"
+echo ""
 
-# 1. 创建目录
-echo -e "\n[1/9] 创建程序目录"
-mkdir -p "${APP_DIR}"
+# 1. 端口占用检测
+echo -e "\033[36m[1/9] 检测端口占用...\033[0m"
+if ss -tulpn | grep ":${PORT}" >/dev/null 2>&1;then
+    echo -e "\033[31m端口${PORT}已被占用，请更换端口重新执行脚本\033[0m"
+    exit 1
+fi
 
-# 2. 安装系统依赖 + 本地节假日库（兼容 PEP 668）
-echo "[2/9] 安装系统依赖 & 节假日组件"
+# 2. 安装依赖
+echo -e "\033[36m[2/9] 安装系统与Python依赖...\033[0m"
 apt update -y
-apt install -y curl jq python3 python3-pip python3-full
-# 绕过系统环境保护安装包
-pip3 install chinesecalendar --break-system-packages
+apt install -y python3 python3-pip iproute2
+pip3 install --upgrade chinesecalendar --break-system-packages
 
-# 3. 编写 chinesecalendar 自动升级脚本（每年12月执行，加兼容参数）
-echo "[3/9] 部署库自动升级脚本"
-cat > "${UPD_SCRIPT}" <<'EOF'
-#!/bin/bash
-LOG_FILE="/opt/shutdown-ctrl/update_cc.log"
-echo "===== $(date '+%Y-%m-%d %H:%M:%S') 执行自动升级 =====" >> ${LOG_FILE}
-python3 -m pip install -U chinesecalendar --break-system-packages >> ${LOG_FILE} 2>&1
-python3 -c "import chinese_calendar; print('当前库版本:', chinese_calendar.__version__)" >> ${LOG_FILE} 2>&1
-echo "===== 升级完成 =====" >> ${LOG_FILE}
-echo "" >> ${LOG_FILE}
+# 3. 生成统一配置文件，完整保留原始密码字符，无多余换行
+echo -e "\033[36m[3/9] 创建程序目录与配置文件...\033[0m"
+mkdir -p /opt/shutdown-ctrl
+rm -f ${CONFIG_FILE}
+cat > ${CONFIG_FILE} <<EOF
+PORT=${PORT}
+PASSWORD=${PASSWORD}
+LOCK_TMP=${LOCK_TMP}
+LOCK_GLB=${LOCK_GLB}
+LOG_FILE=${LOG_FILE}
 EOF
-chmod +x "${UPD_SCRIPT}"
+chmod 600 ${CONFIG_FILE}
 
-# 4. 编写核心定时关机脚本（修复版 - 包含完整缓存、jq语法修正、强制验证）
-echo "[4/9] 部署定时关机核心脚本（修复版 v2.1）"
-cat > "${SHUTDOWN_BIN}" <<'EOF'
+# 4. 定时关机执行脚本
+echo -e "\033[36m[4/9] 部署自动关机定时脚本...\033[0m"
+cat > /usr/local/bin/auto_shutdown_full.sh << 'EOF'
 #!/bin/bash
-set -euo pipefail
-
-# ========== 强制设置 PATH（解决 cron 环境找不到 jq/curl） ==========
+set -e
+source /opt/shutdown-ctrl/config.env
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# ========== 定义自身路径（解决自我调用时 unbound variable） ==========
-SHUTDOWN_BIN="/usr/local/bin/auto_shutdown_full.sh"
-
-ONLY_REFRESH="false"
-if [[ $# -ge 1 && "$1" == "--refresh" ]]; then
-    ONLY_REFRESH="true"
-fi
-
-# 全局路径
-GLOBAL_LOCK="/etc/no_shutdown_all.lock"
-TEMP_LOCK="/tmp/no_shutdown.lock"
-CACHE_FILE="/var/cache/holiday_flat.json"
-API_TIMEOUT=20
-MAX_RETRY=2
-CUR_YEAR=$(date +%Y)
-# chinesecalendar 基准支持年份
-CC_START_YEAR=2004
-CC_END_YEAR=2026
-
-# 日志函数
-log_info() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+fix_lock_perm(){
+    [ -f "$1" ] && chmod 600 "$1"
 }
 
-init_empty_cache() {
-    echo "{}" > "${CACHE_FILE}"
-    chmod 644 "${CACHE_FILE}"
-}
-
-http_get() {
-    local url="$1"
-    local retry=0
-    local res=""
-    while (( retry < MAX_RETRY )); do
-        res=$(curl -s --max-time "${API_TIMEOUT}" "${url}")
-        if [[ "${res}" =~ ^\{ ]]; then
-            echo "${res}"
-            return 0
-        fi
-        log_info "API请求失败，重试 ${retry}/${MAX_RETRY}"
-        ((retry++))
-        sleep 1
-    done
-    return 1
-}
-
-# ======================================================================
-# 方案1：优先在线API bitefu（修复 jq 语法，确保生成全年完整缓存）
-# ======================================================================
-refresh_by_api() {
-    log_info "尝试从在线API获取节假日数据..."
-    local url="https://tool.bitefu.net/jiari/?d=${CUR_YEAR}&json=1"
-    local raw
-    raw=$(http_get "${url}") || return 1
-
-    log_info "API请求成功，开始解析数据..."
-
-    # 1) 用 Python 生成全年基准缓存（周末 false，工作日 true）
-    local base_file="/tmp/base_cache_$$.json"
-    python3 - <<PYEOF > "${base_file}"
-import datetime, json
-year = ${CUR_YEAR}
-start = datetime.date(year, 1, 1)
-end = datetime.date(year, 12, 31)
-cache = {}
-cur = start
-while cur <= end:
-    cache[cur.strftime("%Y-%m-%d")] = cur.weekday() < 5
-    cur += datetime.timedelta(days=1)
-json.dump(cache, open("${base_file}", "w"))
-PYEOF
-
-    # 2) 检查 API 是否包含当年数据
-    if echo "${raw}" | jq -e --arg y "${CUR_YEAR}" '.[$y]' > /dev/null 2>&1; then
-        # 3) 合并：基准 + API覆盖（正确写法，避免 jq 语法错误）
-        jq --argjson base "$(cat "${base_file}")" --arg y "${CUR_YEAR}" '
-            $base + (
-                .[$y] // {} 
-                | to_entries 
-                | map({
-                    key: ($y + "-" + (.key[0:2] + "-" + .key[2:4])),
-                    value: if (.value == "1" or .value == "3" or .value == "4") then false
-                           elif .value == "2" then true
-                           else null end
-                })
-                | map(select(.value != null))
-                | from_entries
-            )
-        ' <<< "${raw}" > "${CACHE_FILE}"
-
-        rm -f "${base_file}"
-        chmod 644 "${CACHE_FILE}"
-
-        local count=$(jq '. | length' "${CACHE_FILE}" 2>/dev/null || echo "0")
-        if [[ "${count}" -eq 365 || "${count}" -eq 366 ]]; then
-            log_info "✅ API解析成功，缓存了 ${count} 天的数据（包含周末和调休）"
-            return 0
-        else
-            log_info "⚠️  API解析结果天数异常（${count}），降级处理"
-            return 1
-        fi
-    else
-        log_info "⚠️  API返回数据格式异常"
-        rm -f "${base_file}"
-        return 1
-    fi
-}
-
-# ======================================================================
-# 方案2：降级到本地 chinesecalendar 库（同样生成全年完整缓存）
-# ======================================================================
-refresh_by_local_lib() {
-    log_info "切换至本地 chinesecalendar 节假日库..."
-    init_empty_cache
-    python3 - <<PYEOF
-import datetime
-from chinese_calendar import is_workday
-import json
-cache = {}
-year = int("${CUR_YEAR}")
-start = datetime.date(year, 1, 1)
-end = datetime.date(year, 12, 31)
-delta = datetime.timedelta(days=1)
-current = start
-while current <= end:
-    d_str = current.strftime("%Y-%m-%d")
-    cache[d_str] = is_workday(current)
-    current += delta
-with open("${CACHE_FILE}", "w", encoding="utf-8") as f:
-    json.dump(cache, f)
-PYEOF
-    log_info "✅ 本地库生成缓存完成"
-    return 0
-}
-
-# ======================================================================
-# 方案3：年份超限兜底：周一至周五为工作日
-# ======================================================================
-refresh_by_week() {
-    log_info "年份超出本地库支持范围，启用周规则兜底(周一~周五=工作日)..."
-    init_empty_cache
-    python3 - <<PYEOF
-import datetime
-import json
-cache = {}
-year = int("${CUR_YEAR}")
-start = datetime.date(year, 1, 1)
-end = datetime.date(year, 12, 31)
-delta = datetime.timedelta(days=1)
-current = start
-while current <= end:
-    d_str = current.strftime("%Y-%m-%d")
-    cache[d_str] = current.weekday() < 5
-    current += delta
-with open("${CACHE_FILE}", "w", encoding="utf-8") as f:
-    json.dump(cache, f)
-PYEOF
-    log_info "✅ 周规则兜底缓存完成"
-    return 0
-}
-
-# ==================== 执行刷新逻辑 ====================
-log_info "==================== 刷新节假日缓存 ===================="
-log_info "当前年份：${CUR_YEAR}"
-
-REFRESH_SUCCESS=false
-
-if refresh_by_api; then
-    REFRESH_SUCCESS=true
-    log_info "✅ 在线API 请求成功"
-elif [[ ${CUR_YEAR} -ge ${CC_START_YEAR} && ${CUR_YEAR} -le ${CC_END_YEAR} ]]; then
-    log_info "❌ API失败，使用本地节假日库"
-    if refresh_by_local_lib; then
-        REFRESH_SUCCESS=true
-    fi
-else
-    log_info "⚠️  年份超出本地库范围，启用周规则兜底"
-    if refresh_by_week; then
-        REFRESH_SUCCESS=true
-    fi
-fi
-
-# 验证缓存有效性
-if [[ "${REFRESH_SUCCESS}" == "true" ]]; then
-    CACHE_COUNT=$(jq '. | length' "${CACHE_FILE}" 2>/dev/null || echo "0")
-    if [[ "${CACHE_COUNT}" -eq 0 ]]; then
-        log_info "⚠️  缓存生成失败（空文件），使用紧急兜底"
-        refresh_by_week
-        REFRESH_SUCCESS=true
-    fi
-fi
-
-log_info "==== 缓存内容预览（前10条） ===="
-jq 'to_entries | .[:10] | from_entries' "${CACHE_FILE}" 2>/dev/null || echo "缓存读取失败"
-
-if [[ "${ONLY_REFRESH}" == "true" ]]; then
-    log_info "缓存刷新完成，不执行关机（--refresh模式）"
+fix_lock_perm "${LOCK_GLB}"
+if [ -f "${LOCK_GLB}" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 全局禁用锁存在，跳过关机" >> ${LOG_FILE}
     exit 0
 fi
 
-# ==================== 关机判定逻辑 ====================
-log_info "==================== 关机判定 ===================="
-if [ -f "${GLOBAL_LOCK}" ]; then
-    log_info "🔒 全局禁用锁存在，不执行关机"
-    exit 0
-fi
-if [ -f "${TEMP_LOCK}" ]; then
-    log_info "🔒 临时禁用锁存在，清理临时锁，本次不关机"
-    rm -f "${TEMP_LOCK}"
+fix_lock_perm "${LOCK_TMP}"
+if [ -f "${LOCK_TMP}" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 临时锁存在，清除锁，今晚不关机" >> ${LOG_FILE}
+    rm -f "${LOCK_TMP}"
     exit 0
 fi
 
-TODAY=$(date +%Y-%m-%d)
-log_info "当前日期：${TODAY}"
+IS_WORK=$(python3 - <<PYEOF
+import datetime, traceback
+try:
+    from chinese_calendar import is_workday
+    print("True" if is_workday(datetime.date.today()) else "False")
+except Exception as e:
+    print("ERR")
+    with open("/var/log/auto_shutdown.log", "a", encoding="utf-8") as f:
+        f.write(f"[{datetime.datetime.now()}] 日历库异常：{traceback.format_exc()}\n")
+PYEOF
+)
 
-# ========== 强制验证缓存中今天日期是否存在，若缺失则立即刷新 ==========
-if ! jq -e --arg t "${TODAY}" '.[$t]' "${CACHE_FILE}" >/dev/null 2>&1; then
-    log_info "⚠️  缓存中今天日期缺失，强制刷新..."
-    "${SHUTDOWN_BIN}" --refresh
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 当日工作日标记: ${IS_WORK}" >> ${LOG_FILE}
+if [ "${IS_WORK}" = "ERR" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日历库故障，安全跳过关机" >> ${LOG_FILE}
+    exit 0
 fi
 
-# 重新读取（无论是否刷新过，都重新获取）
-IS_WORK=$(jq -r --arg t "${TODAY}" '.[$t] // true' "${CACHE_FILE}" 2>/dev/null || echo "true")
-log_info "当日是否工作日：${IS_WORK}"
-
-if [[ "${IS_WORK}" == "true" ]]; then
-    log_info "✅ 执行自动关机"
+if [ "${IS_WORK}" = "True" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 今日工作日，执行关机" >> ${LOG_FILE}
     /sbin/shutdown -h now
 else
-    log_info "⏸️  节假日/周末，跳过关机"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 周末/节假日，跳过关机" >> ${LOG_FILE}
     exit 0
 fi
 EOF
-chmod +x "${SHUTDOWN_BIN}"
+chmod +x /usr/local/bin/auto_shutdown_full.sh
 
-# 5. 部署Python Web控制面板（精简无歧义版 + 缓存状态显示）
-echo "[5/9] 部署Web控制面板（精简无歧义版）"
-cat > "${WEB_SCRIPT}" <<EOF
+# 5. Web面板【新增下次关机日期接口+前端展示】
+echo -e "\033[36m[5/9] 部署带下次关机日期面板...\033[0m"
+cat > /opt/shutdown-ctrl/web.py << 'EOF'
 #!/usr/bin/env python3
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import os
-import json
-import datetime
+import os, subprocess, urllib.parse, datetime
+config = {}
+with open("/opt/shutdown-ctrl/config.env","r",encoding="utf-8") as f:
+    for line in f.readlines():
+        line = line.rstrip("\n")
+        if line and "=" in line:
+            k,v = line.split("=",1)
+            config[k] = v
+PORT = int(config["PORT"])
+PASSWORD = config["PASSWORD"]
+LOCK_TMP = config["LOCK_TMP"]
+LOCK_GLB = config["LOCK_GLB"]
+LOG_FILE = config["LOG_FILE"]
 
-PORT = ${LISTEN_PORT}
-PWD_KEY = "${ACCESS_PWD}"
-LOCK_TMP = "${TEMP_LOCK}"
-LOCK_GLB = "${GLOBAL_LOCK}"
-CACHE_FILE = "${CACHE_FILE}"
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from chinese_calendar import is_workday
 
 class Handler(BaseHTTPRequestHandler):
-    def _html(self, content):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+    def resp(self, code, msg, ctype="text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
         self.end_headers()
-        self.wfile.write(content.encode("utf-8"))
+        self.wfile.write(msg.encode("utf-8"))
 
-    def _text(self, content):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(content.encode("utf-8"))
-
-    def _403(self):
-        self.send_response(403)
-        self.end_headers()
-        self.wfile.write(b"Password Error")
+    def get_post_data(self):
+        length = int(self.headers.get("Content-Length",0))
+        data = self.rfile.read(length).decode("utf-8")
+        return urllib.parse.parse_qs(data, keep_blank_values=True)
 
     def do_GET(self):
-        path = self.path
-        qs = {}
-        if "?" in path:
-            pth, q = path.split("?", 1)
-            for kv in q.split("&"):
-                if "=" in kv:
-                    k, v = kv.split("=", 1)
-                    qs[k] = v
-            path = pth
-
-        pwd = qs.get("p", "")
-
+        path = self.path.split('?')[0]
         if path == "/":
-            html = """
-<html>
-<head><meta charset="utf-8"></head>
-<body style="text-align:center;margin-top:100px;font-family:微软雅黑;">
-<h2>自动关机控制中心</h2>
-<input type="password" id="pw" placeholder="请输入密码">
-<br><br>
-<button onclick="location='/main?p='+document.getElementById('pw').value" style="padding:10px 20px;">登录</button>
-</body>
-</html>
-            """
-            self._html(html)
-            return
-
-        if path == "/main":
-            if pwd != PWD_KEY:
-                self._403()
-                return
-            
-            # 读取锁文件状态
-            has_tmp_lock = os.path.exists(LOCK_TMP)
-            has_glb_lock = os.path.exists(LOCK_GLB)
-
-            # 读取缓存信息
-            today = datetime.date.today()
-            today_str = today.strftime("%Y-%m-%d")
-            is_workday = True
-            cache_days = 0
-            cache_year = "未知"
-            try:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-                cache_days = len(cache)
-                is_workday = cache.get(today_str, True)
-                if cache_days > 0:
-                    # 尝试提取年份
-                    first_key = next(iter(cache.keys()))
-                    if len(first_key) >= 4:
-                        cache_year = first_key[:4]
-            except Exception:
-                pass
-
-            # 计算下次关机日期
-            next_shutdown_text = "无法获取，请刷新缓存"
-            try:
-                delta = datetime.timedelta(days=1)
-                next_day = today + delta
-                for _ in range(365):
-                    nd_str = next_day.strftime("%Y-%m-%d")
-                    nd_work = True
-                    try:
-                        nd_work = cache.get(nd_str, True)
-                    except:
-                        pass
-                    if nd_work:
-                        next_shutdown_text = f"{next_day.strftime('%Y-%m-%d')} 凌晨00:01"
-                        break
-                    next_day += delta
-            except:
-                pass
-
-            # 状态说明文案
-            if has_glb_lock:
-                status_text = "❌ 自动关机已永久关闭（全局禁用）"
-                next_shutdown_text = "永久不执行关机"
-            elif has_tmp_lock:
-                status_text = "⏸️ 临时设置：今晚不关机，明晚自动恢复"
-            else:
-                status_text = "✅ 自动关机已正常开启"
-
-            html = f"""
+            html = '''<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>自动关机控制中心</title>
+<title>自动关机控制面板</title>
 <style>
-    body {{ font-family: "微软雅黑", Arial; text-align: center; margin-top: 80px; line-height: 1.8; }}
-    .status-box {{ background: #f5f5f5; padding: 20px; margin: 20px auto; width: 60%; border-radius: 8px; }}
-    .btn-group {{ margin-top: 30px; }}
-    button {{ padding: 10px 20px; margin: 10px; font-size: 16px; cursor: pointer; border: none; border-radius: 4px; }}
-    .btn-red {{ background: #ff4d4f; color: white; }}
-    .btn-green {{ background: #52c41a; color: white; }}
-    .btn-blue {{ background: #1890ff; color: white; }}
-    .note {{ font-size: 14px; color: #666; margin-top: 20px; text-align: left; width: 60%; margin-left: auto; margin-right: auto; }}
-    .cache-info {{ background: #e6f7ff; padding: 10px; margin: 10px auto; width: 60%; border-radius: 4px; border: 1px solid #91d5ff; }}
+body {font-family: Arial, sans-serif; text-align:center; margin-top:80px; background:#f8f9fa;}
+.box {background:#fff; padding:30px; border-radius:12px; box-shadow:0 2px 12px #00000014; max-width:400px; margin:0 auto;}
+input {padding:10px; width:80%; margin:10px 0; border:1px solid #ccc; border-radius:4px; font-size:16px;}
+button {padding:12px 22px; margin:8px; font-size:15px; border:none; border-radius:6px; cursor:pointer; transition:0.2s;}
+.btn-primary {background:#1890ff; color:#fff;}
+.btn-red {background:#ff4d4f; color:#fff;}
+.btn-green {background:#52c41a; color:#fff;}
+.btn-blue {background:#1890ff; color:#fff;}
+.info {background:#f0f2f5; padding:15px; border-radius:8px; margin:15px 0; font-size:16px; line-height:1.8;}
+.tip {color:#888; font-size:13px; margin-top:20px;}
+#login-area, #control-area {display: none;}
+#login-area {display: block;}
 </style>
 </head>
 <body>
-    <h1>自动关机控制中心</h1>
+<div class="box" id="login-area">
+<h2>自动关机控制面板</h2>
+<p>请输入管理密码登录（支持!@#$%^&*空格中文）</p>
+<input type="password" id="pwd-input" placeholder="密码" autofocus>
+<br>
+<button class="btn-primary" onclick="login()">登录</button>
+<div id="login-error" style="color:red; margin-top:10px;"></div>
+</div>
 
-    <div class="status-box">
-        <h3>当前系统状态</h3>
-        <p>{status_text}</p>
-        <p>⏰ 下次关机时间：{next_shutdown_text}</p>
-    </div>
+<div class="box" id="control-area" style="display:none;">
+<h2>服务器自动关机控制面板</h2>
+<div class="info">
+<p>当前状态：<span id="status">加载中...</span></p>
+<p>今日类型：<span id="today_info">-</span></p>
+<p>下次关机日期：<span id="next_workday">-</span></p>
+</div>
+<div>
+<button class="btn-red" onclick="runCmd('tmp_off')">今晚不关机</button>
+<button class="btn-green" onclick="runCmd('tmp_on')">恢复今晚自动关机</button>
+<button class="btn-red" onclick="runCmd('glb_off')">永久关闭自动关机</button>
+<button class="btn-green" onclick="runCmd('glb_on')">恢复全局自动关机</button>
+<button class="btn-blue" onclick="getState()">刷新状态</button>
+<button class="btn-blue" onclick="logout()">退出登录</button>
+</div>
+<div class="tip">密码本地安全存储，完整兼容所有特殊符号</div>
+</div>
 
-    <div class="cache-info">
-        <p>📅 缓存状态：{cache_days} 天数据（{cache_year}年）</p>
-        <p>📌 今天({today_str})：{"工作日" if is_workday else "节假日/周末"}</p>
-        <p><a href="/refresh_cache?p={pwd}" style="color: #1890ff;">点击手动刷新缓存</a></p>
-    </div>
+<script>
+function showControl() {
+    document.getElementById('login-area').style.display = 'none';
+    document.getElementById('control-area').style.display = 'block';
+    getState();
+}
 
-    <div class="btn-group">
-        <h4>今晚关机控制（单次生效，仅影响今天）</h4>
-        <button class="btn-red" onclick="location='/tmp_off?p={pwd}'">今晚不关机（仅今天有效）</button>
-        <button class="btn-green" onclick="location='/tmp_on?p={pwd}'">恢复今晚关机（取消临时设置）</button>
+async function login() {
+    const rawPwd = document.getElementById('pwd-input').value;
+    document.getElementById('login-error').innerText = '';
+    if (!rawPwd) {
+        document.getElementById('login-error').innerText = '请输入密码';
+        return;
+    }
+    try {
+        const formBody = new URLSearchParams();
+        formBody.append('p', rawPwd);
+        const res = await fetch('/login', {
+            method:'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: formBody.toString()
+        });
+        const retText = await res.text();
+        if (res.status === 403) {
+            document.getElementById('login-error').innerText = '密码错误，请重试';
+            localStorage.removeItem('shutdown_pwd');
+            return;
+        }
+        if (retText === "ok") {
+            localStorage.setItem('shutdown_pwd', rawPwd);
+            showControl();
+        } else {
+            document.getElementById('login-error').innerText = '登录失败';
+        }
+    } catch(e) {
+        document.getElementById('login-error').innerText = '网络请求失败';
+    }
+}
 
-        <br><br>
-        <h4>全局关机控制（永久生效，所有日期都受影响）</h4>
-        <button class="btn-red" onclick="location='/glb_off?p={pwd}'">永久关闭自动关机（所有日期都不关机）</button>
-        <button class="btn-green" onclick="location='/glb_on?p={pwd}'">恢复自动关机（按工作日/节假日规则执行）</button>
-    </div>
+function logout() {
+    localStorage.removeItem('shutdown_pwd');
+    document.getElementById('login-area').style.display = 'block';
+    document.getElementById('control-area').style.display = 'none';
+    document.getElementById('pwd-input').value = '';
+    document.getElementById('login-error').innerText = '';
+}
 
-    <div class="note">
-        <h4>使用说明：</h4>
-        <p>1. 系统会自动识别法定节假日/周末，这些日期不会关机；工作日凌晨00:01会自动关机。</p>
-        <p>2. 「今晚不关机」只影响当天，第二天会自动恢复正常规则，无需手动恢复。</p>
-        <p>3. 「永久关闭自动关机」会一直不关机，需要点击「恢复自动关机」才能重新启用。</p>
-        <p>4. 节假日数据优先从网络接口获取，网络异常时会自动使用本地库兜底。</p>
-        <p>5. 缓存数据包含全年日期，如果发现日期判断错误，可点击「手动刷新缓存」。</p>
-    </div>
+function getPwd() {
+    return localStorage.getItem('shutdown_pwd') || '';
+}
+
+async function postReq(url, data) {
+    const rawPwd = getPwd();
+    if (!rawPwd) {
+        alert('请重新登录');
+        logout();
+        return null;
+    }
+    const formBody = new URLSearchParams();
+    formBody.append('p', rawPwd);
+    for (let key in data) {
+        formBody.append(key, data[key]);
+    }
+    const res = await fetch(url, {
+        method:'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: formBody.toString()
+    });
+    if (res.status === 403) {
+        alert('密码错误，请重新登录');
+        logout();
+        return null;
+    }
+    return await res.text();
+}
+
+async function runCmd(cmd) {
+    const ret = await postReq('/action', {cmd:cmd});
+    if (ret) {
+        alert(ret);
+        getState();
+    }
+}
+
+async function getState() {
+    try {
+        const stat = await postReq('/status', {});
+        const day = await postReq('/today', {});
+        const nextDay = await postReq('/next_date', {});
+        if (stat && day && nextDay) {
+            document.getElementById('status').innerText = stat;
+            document.getElementById('today_info').innerText = day;
+            document.getElementById('next_workday').innerText = nextDay;
+        }
+    } catch(e) {
+        alert('获取状态失败，请重试');
+    }
+}
+
+window.onload = function() {
+    const rawPwd = getPwd();
+    if (rawPwd) {
+        (async () => {
+            try {
+                const formBody = new URLSearchParams();
+                formBody.append('p', rawPwd);
+                const res = await fetch('/login', {
+                    method:'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: formBody.toString()
+                });
+                const txt = await res.text();
+                if (res.ok && txt === "ok") {
+                    showControl();
+                } else {
+                    logout();
+                }
+            } catch(e) {
+                logout();
+            }
+        })();
+    }
+};
+</script>
 </body>
-</html>
-            """
-            self._html(html)
+</html>'''
+            self.resp(200, html, "text/html; charset=utf-8")
+            return
+        self.resp(404, "页面不存在")
+
+    def do_POST(self):
+        path = self.path
+        params_raw = self.get_post_data()
+        input_pwd = params_raw.get("p", [""])[0]
+        real_pwd = PASSWORD
+
+        # 专用登录校验接口
+        if path == "/login":
+            if input_pwd == real_pwd:
+                self.resp(200, "ok")
+            else:
+                self.resp(403, "fail")
             return
 
-        if path == "/refresh_cache":
-            if pwd != PWD_KEY:
-                self._403()
-                return
-            # 调用刷新脚本
-            import subprocess
+        # 全局鉴权拦截所有业务接口
+        if input_pwd != real_pwd:
+            self.resp(403, "密码错误"); return
+
+        if path == "/action":
+            cmd = params_raw.get("cmd", [""])[0]
+            msg = ""
+            if cmd == "tmp_off":
+                open(LOCK_TMP,'a').close()
+                os.chmod(LOCK_TMP, 0o600)
+                msg = "操作成功：今晚不执行自动关机"
+            elif cmd == "tmp_on":
+                try: os.unlink(LOCK_TMP); msg = "操作成功：今晚恢复自动关机"
+                except: msg = "无需操作，临时锁不存在"
+            elif cmd == "glb_off":
+                open(LOCK_GLB,'a').close()
+                os.chmod(LOCK_GLB, 0o600)
+                msg = "操作成功：永久关闭全部自动关机"
+            elif cmd == "glb_on":
+                try: os.unlink(LOCK_GLB); msg = "操作成功：恢复全局自动关机"
+                except: msg = "无需操作，全局锁不存在"
+            else: msg = "无效操作指令"
+            self.resp(200, msg)
+            return
+
+        if path == "/status":
+            if os.path.exists(LOCK_GLB):
+                stat = "❌ 永久禁用自动关机"
+            elif os.path.exists(LOCK_TMP):
+                stat = "⏸️ 临时跳过今晚关机"
+            else:
+                stat = "✅ 自动关机正常启用"
+            self.resp(200, stat)
+            return
+
+        if path == "/today":
             try:
-                result = subprocess.run(
-                    ["/usr/local/bin/auto_shutdown_full.sh", "--refresh"],
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
-                self._text(f"缓存刷新完成\n\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}")
+                today = datetime.date.today()
+                if is_workday(today):
+                    day_info = "工作日"
+                else:
+                    day_info = "周末/法定节假日"
             except Exception as e:
-                self._text(f"缓存刷新失败: {str(e)}")
+                day_info = "日历库读取异常"
+            self.resp(200, day_info)
             return
 
-        if path == "/tmp_off":
-            if pwd != PWD_KEY:
-                self._403()
-                return
-            open(LOCK_TMP, "a").close()
-            self._text("操作成功：今晚不执行自动关机，明天自动恢复")
-            return
-
-        if path == "/tmp_on":
-            if pwd != PWD_KEY:
-                self._403()
-                return
+        # 新增接口：查找下一个工作日（下次关机日期）
+        if path == "/next_date":
             try:
-                os.unlink(LOCK_TMP)
-            except OSError:
-                pass
-            self._text("操作成功：今晚按正常规则执行关机")
+                current = datetime.date.today()
+                next_work = None
+                # 向后循环365天查找第一个工作日
+                for i in range(1, 366):
+                    check_day = current + datetime.timedelta(days=i)
+                    if is_workday(check_day):
+                        next_work = check_day
+                        break
+                if next_work:
+                    date_str = f"{next_work.year}年{next_work.month:02d}月{next_work.day:02d}日 00:01"
+                else:
+                    date_str = "未查询到有效工作日"
+            except Exception as e:
+                date_str = "日期计算异常"
+            self.resp(200, date_str)
             return
 
-        if path == "/glb_off":
-            if pwd != PWD_KEY:
-                self._403()
-                return
-            open(LOCK_GLB, "a").close()
-            self._text("操作成功：永久关闭自动关机，所有日期都不执行")
-            return
-
-        if path == "/glb_on":
-            if pwd != PWD_KEY:
-                self._403()
-                return
-            try:
-                os.unlink(LOCK_GLB)
-            except OSError:
-                pass
-            self._text("操作成功：恢复自动关机，按工作日/节假日规则执行")
-            return
-
-        self.send_response(404)
-        self.end_headers()
-        self.wfile.write(b"Not Found")
+        self.resp(404, "接口不存在")
 
 if __name__ == "__main__":
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     server.serve_forever()
 EOF
-chmod +x "${WEB_SCRIPT}"
+chmod +x /opt/shutdown-ctrl/web.py
 
-# 6. Web系统服务
-echo "[6/9] 配置Web自启服务"
-cat > "${SERVICE_FILE}" <<EOF
+# 6. Systemd服务
+echo -e "\033[36m[6/9] 配置开机自启服务...\033[0m"
+cat > /etc/systemd/system/shutdown-web.service << EOF
 [Unit]
-Description=Auto Shutdown Web Control
-After=network.target
-
+Description=Auto Shutdown Web Control Service
+After=network.target syslog.target
 [Service]
-Type=simple
-ExecStart=/usr/bin/python3 ${WEB_SCRIPT}
+EnvironmentFile=${CONFIG_FILE}
+ExecStart=/usr/bin/python3 /opt/shutdown-ctrl/web.py
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 User=root
-
+StandardOutput=journal+console
+StandardError=journal+console
 [Install]
 WantedBy=multi-user.target
 EOF
-
-# 7. 配置全部定时任务（修复版 - 先清理再添加）
-echo "[7/9] 配置定时任务（关机+缓存刷新+年度自动升级）"
-CRON_DAILY="01 00 * * * ${SHUTDOWN_BIN} >> ${LOG_DAILY} 2>&1"
-CRON_WEEKLY="00 12 * * 1 ${SHUTDOWN_BIN} --refresh >> ${LOG_WEEKLY} 2>&1"
-CRON_UPD1="00 03 1 12 * ${UPD_SCRIPT}"
-CRON_UPD2="00 03 15 12 * ${UPD_SCRIPT}"
-
-# 先清理所有相关任务
-(crontab -l 2>/dev/null || true) \
-| grep -v "auto_shutdown_full.sh" \
-| grep -v "update_cc.sh" \
-| crontab - 2>/dev/null || true
-
-# 再添加新任务（使用追加方式避免覆盖）
-(crontab -l 2>/dev/null || true; echo "${CRON_DAILY}") | crontab -
-(crontab -l 2>/dev/null || true; echo "${CRON_WEEKLY}") | crontab -
-(crontab -l 2>/dev/null || true; echo "${CRON_UPD1}") | crontab -
-(crontab -l 2>/dev/null || true; echo "${CRON_UPD2}") | crontab -
-
-echo "定时任务配置完成"
-crontab -l | grep -E "auto_shutdown|update_cc" || echo "⚠️ 未找到定时任务"
-
-# 8. 初始化缓存 & 放行防火墙
-echo "[8/9] 初始化节假日缓存 & 放行端口"
-
-# 初始化空缓存
-echo "{}" > "${CACHE_FILE}"
-chmod 644 "${CACHE_FILE}"
-
-# 执行首次缓存刷新
-echo "执行首次缓存刷新..."
-if "${SHUTDOWN_BIN}" --refresh; then
-    echo "✅ 缓存初始化成功"
-else
-    echo "⚠️ 缓存初始化失败（API和本地库都不可用），使用周规则兜底"
-    # 手动执行周规则兜底
-    python3 - <<PYEOF
-import datetime
-import json
-cache = {}
-year = datetime.date.today().year
-start = datetime.date(year, 1, 1)
-end = datetime.date(year, 12, 31)
-delta = datetime.timedelta(days=1)
-current = start
-while current <= end:
-    d_str = current.strftime("%Y-%m-%d")
-    cache[d_str] = current.weekday() < 5
-    current += delta
-with open("${CACHE_FILE}", "w", encoding="utf-8") as f:
-    json.dump(cache, f)
-PYEOF
-    echo "✅ 周规则兜底缓存生成完成"
-fi
-
-# 放行防火墙
-ufw allow ${LISTEN_PORT}/tcp 2>/dev/null || true
-ufw reload 2>/dev/null || true
-
-# 9. 启动Web服务
-echo "[9/9] 启动Web控制面板"
 systemctl daemon-reload
-systemctl start shutdown-web
-systemctl enable shutdown-web
+systemctl enable --now shutdown-web
 
-# 验证服务状态
-if systemctl is-active --quiet shutdown-web; then
-    echo "✅ Web服务运行正常"
-else
-    echo "⚠️ Web服务启动失败，请检查日志：journalctl -u shutdown-web -n 50"
+# 7. 定时任务
+echo -e "\033[36m[7/9] 配置每日0点01分关机任务...\033[0m"
+OLD_CRON=$(crontab -l 2>/dev/null | grep -v "auto_shutdown_full.sh")
+echo "$OLD_CRON" > /tmp/new_cron.tmp
+echo "${CRON_TIME} /usr/local/bin/auto_shutdown_full.sh >> ${LOG_FILE} 2>&1" >> /tmp/new_cron.tmp
+crontab /tmp/new_cron.tmp
+rm -f /tmp/new_cron.tmp
+
+# 8. 日志切割
+echo -e "\033[36m[8/9] 配置日志自动切割防止占盘...\033[0m"
+cat > /etc/logrotate.d/auto_shutdown << EOF
+${LOG_FILE} {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 600 root root
+}
+EOF
+
+# 9. 防火墙放行
+echo -e "\033[36m[9/9] 放行端口防火墙...\033[0m"
+if command -v ufw &> /dev/null; then
+    ufw allow ${PORT}/tcp comment "auto shutdown web panel"
+    ufw reload 2>/dev/null || true
 fi
 
-# 完成提示
-LOCAL_IP=$(hostname -I | awk '{print $1}')
-echo -e "\n============================================="
-echo "✅ 全部安装完成！"
-echo "🌐 访问地址：http://${LOCAL_IP}:${LISTEN_PORT}"
-echo "🔑 登录密码：${ACCESS_PWD}"
-echo ""
-echo "⏰ 定时规则："
-echo "   1. 每日 00:01 自动判断并执行关机"
-echo "   2. 每周一 12:00 刷新节假日缓存"
-echo "   3. 每年12月1日、15日 03:00 自动升级节假日库（双次防失败）"
-echo ""
-echo "🔧 优先级架构："
-echo "   在线API(bitefu) → 本地chinesecalendar库 → 周规则兜底"
-echo ""
-echo "📊 验证缓存："
-echo "   cat ${CACHE_FILE} | jq '. | length'  # 查看缓存天数"
-echo "   cat ${CACHE_FILE} | jq '.\"$(date +%Y-%m-%d)\"'  # 查看今天是否工作日"
-echo ""
-echo "🐛 如果遇到问题，查看日志："
-echo "   tail -f ${LOG_DAILY}"
-echo "   tail -f ${LOG_WEEKLY}"
-echo "============================================="
+# 安装完成输出信息
+echo -e "\033[34m======================================================\033[0m"
+echo -e "\033[32m✅ 全部组件安装完成！新增下次关机日期显示\033[0m"
+echo -e "\033[36m访问地址：\033[0m"
+for ip in $(hostname -I); do
+    echo "  http://${ip}:${PORT}"
+done
+echo -e "\033[36m管理密码：${PASSWORD}\033[0m"
+echo -e "\033[36m定时关机：每日00:01\033[0m"
+echo -e "\033[36m执行日志：${LOG_FILE}\033[0m"
+echo -e "\033[36m服务管理命令：\033[0m"
+echo "  systemctl status shutdown-web  查看面板运行状态"
+echo "  systemctl restart shutdown-web 重启Web控制面板"
+echo "  tail -f ${LOG_FILE} 实时查看自动关机执行日志"
+echo -e "\033[34m======================================================\033[0m"
