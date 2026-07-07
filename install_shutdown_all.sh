@@ -4,7 +4,7 @@ set -e
 # ======================默认配置(回车直接使用)======================
 DEFAULT_PORT=6788
 DEFAULT_PASSWORD="admin123"
-CRON_TIME="01 00 * * *"   # 每天00:01
+DEFAULT_CRON_TIME="01 00 * * *"   # 每天00:01
 LOG_FILE="/var/log/auto_shutdown.log"
 UPDATE_LOG="/var/log/auto_shutdown_update.log"
 CONFIG_FILE="/opt/shutdown-ctrl/config.env"
@@ -18,9 +18,9 @@ if [[ $(id -u) -ne 0 ]]; then
 fi
 
 echo -e "\033[34m======================================================\033[0m"
-echo -e "\033[32m  自动关机系统 - cron触发版 (含库自动更新)  \033[0m"
+echo -e "\033[32m  自动关机系统 - 最终稳定版 (无开机自检)  \033[0m"
 echo -e "\033[34m======================================================\033[0m"
-echo -e "\033[36m请设置Web面板端口与管理密码，直接回车使用默认值\033[0m"
+echo -e "\033[36m请设置Web面板端口、管理密码和关机触发时间，直接回车使用默认值\033[0m"
 echo ""
 
 # 交互式输入端口
@@ -59,6 +59,22 @@ while true; do
     fi
 done
 echo -e "\033[32m密码配置完成\033[0m"
+echo ""
+
+# 交互式输入cron时间
+read -rp "请输入关机触发时间(cron表达式，默认 ${DEFAULT_CRON_TIME})：" INPUT_CRON
+if [[ -z "${INPUT_CRON}" ]]; then
+    CRON_TIME=${DEFAULT_CRON_TIME}
+else
+    # 简单校验：检查是否包含5个字段
+    if [[ $(echo "${INPUT_CRON}" | awk '{print NF}') -eq 5 ]]; then
+        CRON_TIME=${INPUT_CRON}
+    else
+        echo -e "\033[31m无效的cron表达式，使用默认值\033[0m"
+        CRON_TIME=${DEFAULT_CRON_TIME}
+    fi
+fi
+echo -e "\033[32m关机触发时间：${CRON_TIME}\033[0m"
 echo -e "\033[34m======================================================\033[0m"
 echo ""
 
@@ -75,7 +91,7 @@ apt update -y
 apt install -y python3 python3-pip
 pip3 install --upgrade chinesecalendar --break-system-packages
 
-# 3. 创建目录与配置文件（使用 printf 避免多余字符）
+# 3. 创建目录与配置文件
 echo -e "\033[36m[3/7] 创建程序目录与配置文件...\033[0m"
 mkdir -p /opt/shutdown-ctrl
 printf "PORT=%s\nPASSWORD=%s\nLOCK_TMP=%s\nLOCK_GLB=%s\nLOG_FILE=%s\nUPDATE_LOG=%s\n" \
@@ -108,7 +124,6 @@ import sys
 import datetime
 import subprocess
 
-# 读取配置
 config = {}
 with open("/opt/shutdown-ctrl/config.env", "r", encoding="utf-8") as f:
     for line in f:
@@ -126,7 +141,6 @@ def log(msg):
         f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
 def main():
-    # 检查锁
     if os.path.exists(LOCK_GLB):
         log("全局禁用锁存在，跳过关机")
         return
@@ -135,7 +149,6 @@ def main():
         os.remove(LOCK_TMP)
         return
 
-    # 判断今天是否为工作日
     try:
         from chinese_calendar import is_workday
         today = datetime.date.today()
@@ -156,18 +169,17 @@ if __name__ == "__main__":
 EOF
 chmod +x /usr/local/bin/shutdown_check.py
 
-# 6. 配置 cron 任务
+# 6. 配置 cron 任务（仅用户指定的时间，无 @reboot）
 echo -e "\033[36m[6/7] 配置定时任务...\033[0m"
+# 清理旧任务
 (crontab -l 2>/dev/null | grep -v -E "shutdown_check.py|update_lib.sh") | crontab - 2>/dev/null || true
-# 关机判断：每天00:01
+# 添加关机判断任务
 (crontab -l 2>/dev/null; echo "${CRON_TIME} /usr/bin/python3 /usr/local/bin/shutdown_check.py >> ${LOG_FILE} 2>&1") | crontab -
-# 开机补检查：系统启动时执行一次（额外保障）
-(crontab -l 2>/dev/null; echo "@reboot sleep 30 && /usr/bin/python3 /usr/local/bin/shutdown_check.py >> ${LOG_FILE} 2>&1") | crontab -
-# 库更新：每年12月1日03:00
-(crontab -l 2>/dev/null; echo "0 3 1 12 * /opt/shutdown-ctrl/update_lib.sh") | crontab -
+# 添加库更新任务（每年12月12日12:00）
+(crontab -l 2>/dev/null; echo "0 12 12 12 * /opt/shutdown-ctrl/update_lib.sh") | crontab -
 echo "定时任务已添加"
 
-# 7. 部署 Web 面板（修复密码特殊字符问题）
+# 7. 部署 Web 面板（密码输入框版，支持特殊字符）
 echo -e "\033[36m[7/7] 部署Web面板...\033[0m"
 cat > /opt/shutdown-ctrl/web.py << 'EOF'
 #!/usr/bin/env python3
@@ -196,7 +208,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(msg.encode("utf-8"))
 
     def get_post_data(self):
-        # 处理 application/x-www-form-urlencoded
         length = int(self.headers.get("Content-Length",0))
         data = self.rfile.read(length).decode("utf-8")
         return dict(urllib.parse.parse_qsl(data, keep_blank_values=True))
@@ -265,7 +276,6 @@ async function login() {
         return;
     }
     try {
-        // 使用 URLSearchParams 发送 application/x-www-form-urlencoded
         const params = new URLSearchParams();
         params.append('p', pwd);
         const res = await fetch('/status', {
@@ -456,7 +466,7 @@ if command -v ufw &> /dev/null; then
     ufw reload 2>/dev/null || true
 fi
 
-# 输出信息
+# 输出信息（修正后的描述）
 echo -e "\033[34m======================================================\033[0m"
 echo -e "\033[32m✅ 全部组件安装完成！\033[0m"
 echo -e "\033[36m访问地址：\033[0m"
@@ -464,10 +474,8 @@ for ip in $(hostname -I); do
     echo "  http://${ip}:${PORT}"
 done
 echo -e "\033[36m管理密码：${PASSWORD}\033[0m"
-echo -e "\033[36m定时任务：\033[0m"
-echo "  每日 ${CRON_TIME} 执行关机判断"
-echo "  开机后30秒补执行一次检查（增强可靠性）"
-echo "  每年12月1日03:00 自动更新 chinesecalendar 库"
+echo -e "\033[36m定时关机：每日 ${CRON_TIME}\033[0m"
+echo -e "\033[36m库更新：每年12月12日12:00 自动更新 chinesecalendar\033[0m"
 echo -e "\033[36m运行日志：${LOG_FILE}\033[0m"
 echo -e "\033[36m更新日志：${UPDATE_LOG}\033[0m"
 echo -e "\033[36m服务命令：\033[0m"
